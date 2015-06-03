@@ -54,7 +54,24 @@
 // ------------------------------------------------------------------------------
 
 #include "rc_control.h"
-
+enum autopilot_modes {
+    STABILIZE =     0,  // manual airframe angle with manual throttle
+    ACRO =          1,  // manual body-frame angular rate with manual throttle
+    ALT_HOLD =      2,  // manual airframe angle with automatic throttle
+    AUTO =          3,  // fully automatic waypoint control using mission commands
+    GUIDED =        4,  // fully automatic fly to coordinate or fly at velocity/direction using GCS immediate commands
+    LOITER =        5,  // automatic horizontal acceleration with automatic throttle
+    RTL =           6,  // automatic return to launching point
+    CIRCLE =        7,  // automatic circular flight with automatic throttle
+    LAND =          9,  // automatic landing with horizontal position control
+    OF_LOITER =    10,  // deprecated
+    DRIFT =        11,  // semi-automous position, yaw and throttle control
+    SPORT =        13,  // manual earth-frame angular rate control with manual throttle
+    FLIP =         14,  // automatically flip the vehicle on the roll axis
+    AUTOTUNE =     15,  // automatically tune the vehicle's roll and pitch gains
+    POSHOLD =      16,  // automatic position hold with manual override, with automatic throttle
+    BRAKE =        17   // full-brake using inertial/GPS system, no pilot input
+};
 struct Time_Stamps
 {
 	Time_Stamps()
@@ -142,6 +159,21 @@ struct Mavlink_Messages {
 
 };
 
+struct control_command {
+	int empty_index;
+	int list_index;
+	int maxCount;
+	mavlink_message_t message[8];
+
+	void init(){
+		empty_index = 0;
+		list_index = 0;
+		maxCount = 8;
+		memset(message,0,sizeof(mavlink_message_t)*maxCount);
+	}
+
+
+};
 struct control_status {
 	Serial_Port *serial;
 	int system_id;
@@ -149,6 +181,8 @@ struct control_status {
 	int companion_id;
 	bool time_to_exit;
 	struct Mavlink_Messages message_buf;
+	bool has_write_cmd ;
+	mavlink_message_t cmd_message;
 
 	void init()
 	{
@@ -158,6 +192,7 @@ struct control_status {
 		companion_id = 0;
 		time_to_exit = false;
 		message_buf.init();
+		has_write_cmd = false;
 		printf("ruan: init control_data \n");
 	}
 }control_data;
@@ -177,7 +212,7 @@ int send_heartbeat_messages(control_status *cs)
 	mavlink_message_t message;
 
 // fill with the sp 
-
+	sp.type = MAV_TYPE_GCS;
 
 	mavlink_msg_heartbeat_encode(cs->system_id,cs->companion_id,&message, &sp);
 	int len = cs->serial->write_message(message);
@@ -188,15 +223,62 @@ int send_heartbeat_messages(control_status *cs)
 	return ret;
 }
 
+int send_message_package(control_status *cs, int cmd, void * msg_sp)
+{
+	mavlink_message_t message;
+	int sysid=255,compid=MAV_COMP_ID_MISSIONPLANNER;
+	switch(cmd){
+		case MAVLINK_MSG_ID_RADIO_STATUS:
+		{
+			mavlink_radio_status_t *radio_sp = (mavlink_radio_status_t *) msg_sp;
+			//mavlink_msg_radio_status_encode(cs->message_buf.sysid, cs->message_buf.compid , &message, radio_sp);
+			mavlink_msg_radio_status_encode(sysid, compid , &message, radio_sp);
+			break;
+		}
+		case MAVLINK_MSG_ID_HEARTBEAT:
+		{
+			mavlink_heartbeat_t *heart_sp= (mavlink_heartbeat_t *)msg_sp;
+			mavlink_msg_heartbeat_encode(sysid, compid,&message, heart_sp);
+			//mavlink_msg_heartbeat_encode(cs->system_id,cs->companion_id,&message, heart_sp);
+			break;
+		}
+		case MAVLINK_MSG_ID_COMMAND_ACK:
+		{
+			mavlink_command_long_t *cmd_sp = (mavlink_command_long_t *) msg_sp;
+			mavlink_msg_command_long_encode(sysid, compid , &message, cmd_sp);
+			break;
+		}
+		default:
+		{
+			// printf("Warning, did not handle message id %i\n",message.msgid);
+			break;
+		}
+	}
+	int len = cs->serial->write_message(message);
+	if ( not len > 0 ){
+		printf("Error: could not send message\n");
+	}
+	return len;
+}
+
 void read_messages(control_status *cs)
 {
 	bool success;               // receive success flag
+	int ret = 0;
 	Time_Stamps this_timestamps;
 	Mavlink_Messages *current_messages = &cs->message_buf;
 
 	// Blocking wait for new data
 	while ( not cs->time_to_exit )
 	{
+		if( cs->has_write_cmd ){
+			int len  = cs->serial->write_message(cs->cmd_message);
+			if ( not len > 0 )
+				fprintf(stderr,"WARNING: could not send message , msgid=%d\n",cs->cmd_message.msgid);
+			else
+				printf("send message ok , msgid = %d\n",cs->cmd_message.msgid);
+			cs->has_write_cmd = false;
+		}
 		// ----------------------------------------------------------------------
 		//   READ MESSAGE
 		// ----------------------------------------------------------------------
@@ -214,7 +296,7 @@ void read_messages(control_status *cs)
 			current_messages->sysid  = message.sysid;
 			current_messages->compid = message.compid;
 
-
+			//printf("RUAN: recive message mid=%d,sysid=%d,compid=%d,sque=%d\n",message.msgid,message.sysid,message.compid,message.seq);
 
 			// Handle Message ID
 			switch (message.msgid)
@@ -222,13 +304,52 @@ void read_messages(control_status *cs)
 
 				case MAVLINK_MSG_ID_HEARTBEAT:
 				{
+					if( cs->system_id ==0  || cs->companion_id == 0){
+						cs->system_id = cs->message_buf.sysid;
+						cs->companion_id = cs->message_buf.compid;
+					}
 					//printf("MAVLINK_MSG_ID_HEARTBEAT\n");
 					mavlink_msg_heartbeat_decode(&message, &(current_messages->heartbeat));
 					current_messages->time_stamps.heartbeat = get_time_usec();
 					this_timestamps.heartbeat = current_messages->time_stamps.heartbeat;
+					//send_heartbeat_messages(cs);
+					mavlink_heartbeat_t heart_sp ;
+					heart_sp.type = MAV_TYPE_GCS;
+					send_message_package(cs,MAVLINK_MSG_ID_HEARTBEAT,&heart_sp);
 					break;
 				}
 
+				case MAVLINK_MSG_ID_RADIO_STATUS:
+				{
+					//printf("MAVLINK_MSG_ID_RADIO_STATUS\n");
+					mavlink_msg_radio_status_decode(&message, &(current_messages->radio_status));
+					current_messages->time_stamps.radio_status = get_time_usec();
+					this_timestamps.radio_status = current_messages->time_stamps.radio_status;
+					//printf("radio status: rxerrors=%d,fixed=%d,rssi=%d,remrssi=%d,txbuf=%d,noise=%d,remnoise=%d",current_messages->radio_status.rxerrors, \
+						current_messages->radio_status.fixed, \
+						current_messages->radio_status.rssi, \
+						current_messages->radio_status.remrssi, \
+						current_messages->radio_status.txbuf, \
+						current_messages->radio_status.noise, \
+						current_messages->radio_status.remnoise \
+						);
+
+					mavlink_radio_status_t sp;
+					sp.rxerrors = 0;
+					sp.fixed = 0;
+					sp.rssi = 80;
+
+					//send_message_package(cs,MAVLINK_MSG_ID_RADIO_STATUS,&sp);
+					break;
+				}
+				case MAVLINK_MSG_ID_COMMAND_ACK:
+				{
+					mavlink_command_ack_t ack_sp;
+					ack_sp.command = 0;
+					ack_sp.result = 0;
+					//send_message_package(cs,MAVLINK_MSG_ID_COMMAND_ACK,&ack_sp);
+					printf("RUAN:  cammand ack , cmd=%d,result=%d\n",mavlink_msg_command_ack_get_command(&message),mavlink_msg_command_ack_get_result(&message));
+				}
 				case MAVLINK_MSG_ID_SYS_STATUS:
 				{
 					//printf("MAVLINK_MSG_ID_SYS_STATUS\n");
@@ -247,14 +368,6 @@ void read_messages(control_status *cs)
 					break;
 				}
 
-				case MAVLINK_MSG_ID_RADIO_STATUS:
-				{
-					//printf("MAVLINK_MSG_ID_RADIO_STATUS\n");
-					mavlink_msg_radio_status_decode(&message, &(current_messages->radio_status));
-					current_messages->time_stamps.radio_status = get_time_usec();
-					this_timestamps.radio_status = current_messages->time_stamps.radio_status;
-					break;
-				}
 
 				case MAVLINK_MSG_ID_LOCAL_POSITION_NED:
 				{
@@ -415,6 +528,40 @@ void quit_handler( int sig )
 
 }
 
+void send_command(int cmd, void * data)
+ {
+#if 0
+       int sysid=255,compid=MAV_COMP_ID_MISSIONPLANNER;
+#else
+       int sysid=control_data.system_id;
+       int compid=control_data.companion_id;
+#endif    
+
+       while( control_data.has_write_cmd ) usleep(100000);
+       memset(&control_data.cmd_message,0,sizeof(mavlink_message_t));
+       switch( cmd ){
+               case MAVLINK_MSG_ID_COMMAND_LONG:
+               {
+                       printf("pack command long package\n");
+                       mavlink_command_long_t *cmd_sp = (mavlink_command_long_t *) data;
+                       mavlink_msg_command_long_encode(control_data.system_id,control_data.companion_id,&control_data.cmd_message,cmd_sp);
+                       break;
+               }
+	       case MAVLINK_MSG_ID_SET_MODE:
+	       {
+                       printf("pack set mode package\n");
+                       mavlink_set_mode_t *mode_sp = (mavlink_set_mode_t *) data;
+                       mavlink_msg_set_mode_encode(control_data.system_id,control_data.companion_id,&control_data.cmd_message,mode_sp);
+                       break;
+	       }
+               default:
+                       return ;
+                       break;
+       }
+ 
+       control_data.has_write_cmd = true;
+       while( control_data.has_write_cmd ) usleep(10000);
+}
 // ------------------------------------------------------------------------------
 //   TOP
 // ------------------------------------------------------------------------------
@@ -431,6 +578,7 @@ int top (int argc, char **argv)
 	int result;
 	char cmd;
 	bool quit_app = false;
+	int val;
 	pthread_t read_tid;
 
 	// do the parse, will throw an int if it fails
@@ -453,18 +601,70 @@ int top (int argc, char **argv)
 		if( control_data.system_id ==0  || control_data.companion_id == 0){
 			control_data.system_id = control_data.message_buf.sysid?control_data.message_buf.sysid:0;
 			control_data.companion_id = control_data.message_buf.compid?control_data.message_buf.compid:0;
+			continue;
 		}	
 
+//MAV_CMD_DO_SET_MODE, MAV_CMD_DO_SET_PARAMETER, MAV_CMD_COMPONENT_ARM_DISARM(1 to arm, 0 to disarm), 
 		cmd = getchar();
 		switch(cmd){
 			case 'q':
+			{
 				quit_app = true;
 				break;
+			}
+			case 'm':
+			{
+				char type = getchar();
+				if( 0xa == type ){ //enter
+					printf("Ruan: check the mode ... \n");
+					printf("status： custom_mode=%d , autopilot=%d, base_mode=%d, system_status=%d \n",control_data.message_buf.heartbeat.custom_mode,control_data.message_buf.heartbeat.autopilot,control_data.message_buf.heartbeat.base_mode,control_data.message_buf.heartbeat.system_status );
+					//val = cmd_check_mode();
+				}else{
+					mavlink_set_mode_t mode_sp;
+					mode_sp.base_mode = control_data.message_buf.heartbeat.base_mode;// MAV_MODE_FLAG_CUSTOM_MODE_ENABLED  ;// MAV_MODE_FLAG_DECODE_POSITION_SAFETY ;
+					switch(type){
+						case 's':
+							printf( "Set stabliable mode \n");
+							mode_sp.custom_mode=  STABILIZE;
+							break;
+						case 'a':
+							printf( "Set ALT_HOLD mode \n");
+							mode_sp.custom_mode=  ALT_HOLD;
+							break;
+						default:
+							printf( "Set stabliable mode \n");
+							mode_sp.custom_mode=  STABILIZE;
+							break;
+					}
+					//MAVLINK_MSG_ID_SET_MODE
+					send_command(MAVLINK_MSG_ID_SET_MODE, &mode_sp);
+
+				}
+				break;
+			}
+			case 'a':
+			{
+				//msgid=COMMAND_LONG
+				mavlink_command_long_t sp;
+				sp.command = MAV_CMD_COMPONENT_ARM_DISARM;
+				sp.target_system = 255;//control_data.system_id;
+				sp.target_component == MAV_COMP_ID_MISSIONPLANNER; 
+				if( '1' == getchar() ){
+					printf("Ruan: send arm cmd ... \n");
+					sp.param1=1;
+				}else{
+					printf("Ruan: send disarm cmd ... \n");
+					sp.param1=0;
+				}
+				send_command(MAVLINK_MSG_ID_COMMAND_LONG, &sp);
+				break;
+			}
 			default:
-				printf("read char=0x%x\n>",cmd);
 				break;
 
 		}
+		if( 0xa != cmd ) printf("read char=0x%x\n>",cmd);
+		else printf(">");
 	}
 
 	printf("ruan: wait for thread exit \n");
