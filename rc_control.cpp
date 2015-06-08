@@ -174,6 +174,19 @@ struct control_command {
 
 
 };
+
+typedef struct _rc_param_t {
+	int dz;
+	int max;
+	int min;
+	int rev;
+	int trim;
+}rc_param_t;
+#define RC_COUNT 4
+#define PARAM_COUNT 488
+char *rc_param_name[5]={"DZ","MIN","MAX","TRIM","REV"};
+
+
 struct control_status {
 	Serial_Port *serial;
 	int system_id;
@@ -182,6 +195,14 @@ struct control_status {
 	bool time_to_exit;
 	struct Mavlink_Messages message_buf;
 	bool has_write_cmd ;
+	bool find_copter;
+	bool has_connect;
+	int ack_cmd;
+	int ack_result;
+	bool param_cmd_recive;
+	rc_param_t rc[RC_COUNT];
+	mavlink_param_value_t param[PARAM_COUNT];
+	
 	mavlink_message_t cmd_message;
 
 	void init()
@@ -193,10 +214,16 @@ struct control_status {
 		time_to_exit = false;
 		message_buf.init();
 		has_write_cmd = false;
+		find_copter =false;
+		has_connect =false;
+		param_cmd_recive =false;
+		memset(rc,0,sizeof(rc_param_t)*RC_COUNT);
 		printf("ruan: init control_data \n");
 	}
 }control_data;
 
+bool open_debug=0;
+#define debug(X...) if(open_debug) printf(X) 
 uint64_t
 get_time_usec()
 {
@@ -205,6 +232,11 @@ get_time_usec()
 	return _time_stamp.tv_sec*1000000 + _time_stamp.tv_usec;
 }
 
+// MAVLINK_MSG_ID_RC_CHANNELS_OVERRIDE
+mavlink_rc_channels_override_t rc_channel;
+bool start_send_rc = false;
+int dv1,dv2,dv3,dv4;
+ 
 int send_heartbeat_messages(control_status *cs)
 {
 	int ret = 0;
@@ -279,6 +311,16 @@ void read_messages(control_status *cs)
 				printf("send message ok , msgid = %d\n",cs->cmd_message.msgid);
 			cs->has_write_cmd = false;
 		}
+		if( start_send_rc ){
+			int sysid=255,compid=MAV_COMP_ID_MISSIONPLANNER;
+			mavlink_message_t rc_message;
+			mavlink_msg_rc_channels_override_encode(sysid,compid,&rc_message,&rc_channel);
+			int len  = cs->serial->write_message(rc_message);
+			if ( not len > 0 )
+				printf("send rc message false \n");
+			else
+				printf("send rc message ok\n");
+		}
 		// ----------------------------------------------------------------------
 		//   READ MESSAGE
 		// ----------------------------------------------------------------------
@@ -291,6 +333,7 @@ void read_messages(control_status *cs)
 		if( success )
 		{
 
+			debug("read message： msgid=%d,sysid=%d,compid=%d\n",message.msgid,message.sysid,message.compid);
 			// Store message sysid and compid.
 			// Note this doesn't handle multiple message sources.
 			current_messages->sysid  = message.sysid;
@@ -307,6 +350,7 @@ void read_messages(control_status *cs)
 					if( cs->system_id ==0  || cs->companion_id == 0){
 						cs->system_id = cs->message_buf.sysid;
 						cs->companion_id = cs->message_buf.compid;
+						cs->find_copter = true;
 					}
 					//printf("MAVLINK_MSG_ID_HEARTBEAT\n");
 					mavlink_msg_heartbeat_decode(&message, &(current_messages->heartbeat));
@@ -348,7 +392,29 @@ void read_messages(control_status *cs)
 					ack_sp.command = 0;
 					ack_sp.result = 0;
 					//send_message_package(cs,MAVLINK_MSG_ID_COMMAND_ACK,&ack_sp);
-					printf("RUAN:  cammand ack , cmd=%d,result=%d\n",mavlink_msg_command_ack_get_command(&message),mavlink_msg_command_ack_get_result(&message));
+					cs->ack_cmd = mavlink_msg_command_ack_get_command(&message);
+					cs->ack_result = mavlink_msg_command_ack_get_result(&message);
+					printf("RUAN:  cammand ack , cmd=%d,result=%d\n",cs->ack_cmd,cs->ack_result);
+				}
+				case MAVLINK_MSG_ID_PARAM_VALUE:
+				{
+					mavlink_param_value_t *p_sp;
+					int index = mavlink_msg_param_value_get_param_index(&message);
+					if( index < PARAM_COUNT ){
+						p_sp = &cs->param[index];
+						mavlink_msg_param_value_decode(&message , p_sp);
+						debug("ruan: param%d value  param_value=%f,param_count=%d,param_index=%d,param_id=%s,param_type=%d \n",index,p_sp->param_value, p_sp->param_count,p_sp->param_index,p_sp->param_id,p_sp->param_type);
+						cs->param_cmd_recive = true;
+						printf("param[%d].param_value=%f\n",index,cs->param[index].param_value);
+					}
+
+					
+					/*
+					mavlink_command_ack_t ack_sp;
+					ack_sp.command = MAVLINK_MSG_ID_PARAM_VALUE;
+					ack_sp.result = 0;
+					send_message_package(cs,MAVLINK_MSG_ID_COMMAND_ACK,&ack_sp);
+					*/
 				}
 				case MAVLINK_MSG_ID_SYS_STATUS:
 				{
@@ -510,6 +576,7 @@ void parse_commandline(int argc, char **argv, char *&uart_name, int &baudrate)
 //   Quit Signal Handler
 // ------------------------------------------------------------------------------
 // this function is called when you press Ctrl-C
+pthread_t read_tid;
 void quit_handler( int sig )
 {
 	printf("\n");
@@ -519,6 +586,8 @@ void quit_handler( int sig )
 	try {
 		if( control_data.serial != NULL )
 			control_data.serial->handle_quit(sig);
+		control_data.time_to_exit = true;
+		pthread_join(read_tid,NULL);
 	}
 	catch (int error){}
 
@@ -554,7 +623,14 @@ void send_command(int cmd, void * data)
                        mavlink_msg_set_mode_encode(control_data.system_id,control_data.companion_id,&control_data.cmd_message,mode_sp);
                        break;
 	       }
-               default:
+	       case MAVLINK_MSG_ID_PARAM_REQUEST_READ:
+	       {
+			printf("pack read param \n");
+			mavlink_param_request_read_t *p_sp = (mavlink_param_request_read_t *)data;
+			mavlink_msg_param_request_read_encode(control_data.system_id,control_data.companion_id,&control_data.cmd_message,p_sp);
+			break;
+	       }
+	       default:
                        return ;
                        break;
        }
@@ -579,7 +655,6 @@ int top (int argc, char **argv)
 	char cmd;
 	bool quit_app = false;
 	int val;
-	pthread_t read_tid;
 
 	// do the parse, will throw an int if it fails
 	parse_commandline(argc, argv, uart_name, baudrate);
@@ -597,13 +672,7 @@ int top (int argc, char **argv)
 
 	printf("Into cmd mode :\n>");
 	while(not quit_app){
-		// first time connect init 
-		if( control_data.system_id ==0  || control_data.companion_id == 0){
-			control_data.system_id = control_data.message_buf.sysid?control_data.message_buf.sysid:0;
-			control_data.companion_id = control_data.message_buf.compid?control_data.message_buf.compid:0;
-			continue;
-		}	
-
+			
 //MAV_CMD_DO_SET_MODE, MAV_CMD_DO_SET_PARAMETER, MAV_CMD_COMPONENT_ARM_DISARM(1 to arm, 0 to disarm), 
 		cmd = getchar();
 		switch(cmd){
@@ -658,6 +727,76 @@ int top (int argc, char **argv)
 				}
 				send_command(MAVLINK_MSG_ID_COMMAND_LONG, &sp);
 				break;
+			}
+			case 'p':
+			{
+
+				mavlink_param_request_read_t p_sp;
+				int wait_times;
+				//67-86 rc1 - rc4  min,trim,max,rev,dz,FUNCTION
+				//for (int i=0; i< PARAM_COUNT; i++){
+				for (int i=67; i<= 86; i++){
+					printf(" get param %d\n",i);
+					p_sp.param_index = i;
+					p_sp.target_system= control_data.system_id;
+					p_sp.target_component = control_data.companion_id;
+					control_data.param_cmd_recive = false;
+					send_command(MAVLINK_MSG_ID_PARAM_REQUEST_READ,&p_sp);
+
+					wait_times = 0;
+					while( not control_data.param_cmd_recive && wait_times++ < 300) usleep(10000);
+					if( wait_times >= 30){
+						printf("read param %d time out\n",i);
+						break;
+					}
+				}
+				printf("RC1_min=%f,rc1_trim=%f,rc1_max=%f\n",control_data.param[67].param_value,control_data.param[68].param_value,control_data.param[69].param_value);
+				
+
+				break;
+			}
+			case '0':
+			{
+				printf("open or close log\n");
+				open_debug = open_debug?false:true ;
+				break;
+			}
+			case 'c':
+			{
+				//init rc_channel
+				memset(&rc_channel,0,sizeof(mavlink_rc_channels_override_t));
+				rc_channel.target_system = control_data.system_id;
+				rc_channel.target_component = control_data.companion_id;
+				rc_channel.chan1_raw = control_data.param[68].param_value;
+				dv1 = (control_data.param[68].param_value - control_data.param[67].param_value)/10;
+
+				rc_channel.chan2_raw = control_data.param[73].param_value;
+				dv2 = (control_data.param[73].param_value - control_data.param[72].param_value)/10;
+
+				rc_channel.chan3_raw = control_data.param[78].param_value;
+				dv3 = (control_data.param[78].param_value - control_data.param[77].param_value)/10;
+				
+				rc_channel.chan4_raw = control_data.param[83].param_value;
+				dv4 = (control_data.param[83].param_value - control_data.param[82].param_value)/10;
+
+				start_send_rc = true;
+				while(start_send_rc){
+					switch(getchar()){
+						case '4':
+						{
+							rc_channel.chan2_raw -= dv2;
+							break;
+						}
+						case 'q':
+						{
+							start_send_rc  = false;		
+							break;
+						}
+						default :
+							break;
+					}
+
+				}
 			}
 			default:
 				break;
